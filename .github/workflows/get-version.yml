@@ -1,0 +1,35 @@
+name: 【Repobot】Sync Tag to Branch
+on:
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: '请输入 Upstream 的 Tag 版本号 (例如: v26.7.28)'
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  sync-branch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Fetch tag with history and push (including .github/workflows)
+        run: |
+          TAG="${{ inputs.version_tag }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/XTLS/Xray-core.git || true
+
+          git fetch upstream tag "$TAG" --no-tags
+
+          git checkout -B "$TAG" FETCH_HEAD
+
+          git push "https://x-access-token:${{ secrets.RELEASE_PAT }}@github.com/${{ github.repository }}.git" "refs/heads/$TAG:refs/heads/$TAG" --force

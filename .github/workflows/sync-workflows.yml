@@ -1,0 +1,51 @@
+name: 【Repobot】Sync Workflows from Main to Master
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/**'
+permissions:
+  contents: write
+jobs:
+  sync-workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout master branch
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Copy workflows from main into master
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin main
+
+          if ! git ls-tree -d FETCH_HEAD -- .github/workflows > /dev/null 2>&1 || \
+             [ -z "$(git ls-tree -d FETCH_HEAD -- .github/workflows)" ]; then
+            echo "main 分支没有 .github/workflows 目录，跳过。"
+            exit 0
+          fi
+
+          rm -rf /tmp/main-workflows
+          mkdir -p /tmp/main-workflows
+          git archive FETCH_HEAD -- .github/workflows | tar -x -C /tmp/main-workflows
+
+          mkdir -p .github/workflows
+          cp -f /tmp/main-workflows/.github/workflows/*.yml .github/workflows/ 2>/dev/null || true
+          cp -f /tmp/main-workflows/.github/workflows/*.yaml .github/workflows/ 2>/dev/null || true
+
+          git add .github/workflows
+
+          if git diff --cached --quiet; then
+            echo "没有变化，无需提交。"
+          else
+            git commit -m "chore: sync workflows from main [skip ci]"
+            git push "https://x-access-token:${{ secrets.RELEASE_PAT }}@github.com/${{ github.repository }}.git" HEAD:refs/heads/master
+            echo "已将 main 的 workflows 同步到 master。"
+          fi
