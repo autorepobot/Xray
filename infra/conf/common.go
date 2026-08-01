@@ -317,6 +317,12 @@ func (v *Int32Range) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &str); err == nil {
 		left, right, err := ParseRangeString(str)
 		if err == nil {
+			// ParseRangeString returns the platform-sized int used by several
+			// callers. Check this narrower representation before converting so
+			// oversized JSON strings cannot wrap into valid sentinel values.
+			if left < math.MinInt32 || left > math.MaxInt32 || right < math.MinInt32 || right > math.MaxInt32 {
+				return errors.New("integer range value exceeds int32 bounds")
+			}
 			v.Left, v.Right = int32(left), int32(right)
 			return nil
 		}

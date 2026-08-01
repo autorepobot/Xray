@@ -203,6 +203,32 @@ func TestOverRangeStringPort(t *testing.T) {
 	}
 }
 
+func TestInt32RangeRejectsStringOverflow(t *testing.T) {
+	tests := []string{
+		`"2147483648"`,
+		`"-2147483649"`,
+		`"4294967295"`,
+		`"4294967296"`,
+		`"4294967297-4294967298"`,
+	}
+	for _, input := range tests {
+		var value Int32Range
+		if err := json.Unmarshal([]byte(input), &value); err == nil {
+			t.Errorf("overflowing Int32Range unexpectedly accepted: %s", input)
+		}
+	}
+}
+
+func TestInt32RangeAcceptsStringBounds(t *testing.T) {
+	var value Int32Range
+	if err := json.Unmarshal([]byte(`"-2147483648-2147483647"`), &value); err != nil {
+		t.Fatal(err)
+	}
+	if value.From != -2147483648 || value.To != 2147483647 {
+		t.Fatalf("Int32Range = %d-%d, want full int32 range", value.From, value.To)
+	}
+}
+
 func TestUserParsing(t *testing.T) {
 	user := new(User)
 	common.Must(json.Unmarshal([]byte(`{
