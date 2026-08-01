@@ -6,6 +6,8 @@ import (
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
+	stderrors "errors"
+	stdnet "net"
 	"net/http"
 	"sync"
 	"time"
@@ -27,17 +29,18 @@ type task struct {
 }
 
 var (
-	conns       chan *websocket.Conn
-	server      *http.Server
-	currentAddr string
-	mu          sync.Mutex
+	conns           chan *websocket.Conn
+	server          *http.Server
+	browserListener stdnet.Listener
+	currentAddr     string
+	mu              sync.Mutex
 )
 
 var upgrader = &websocket.Upgrader{
 	ReadBufferSize:   0,
 	WriteBufferSize:  0,
 	HandshakeTimeout: time.Second * 4,
-	CheckOrigin: func(r *http.Request) bool {
+	CheckOrigin: func(*http.Request) bool {
 		return true
 	},
 }
@@ -53,47 +56,106 @@ func Reload() {
 	}
 
 	if server != nil {
-		server.Close()
+		_ = server.Close()
 		server = nil
 	}
-	if HasBrowserDialer() {
-		for len(conns) > 0 {
+	if browserListener != nil {
+		// http.Server only tracks a listener after Serve has started. Retain and
+		// close our own reference as well so an immediate reload can't strand the
+		// socket in the gap between net.Listen and Serve registration.
+		_ = browserListener.Close()
+		browserListener = nil
+	}
+	if conns != nil {
+		connections := conns
+		conns = nil
+		for len(connections) > 0 {
 			select {
-			case c := <-conns:
+			case c := <-connections:
 				c.Close()
 			default:
 			}
 		}
-		conns = nil
+		close(connections)
 	}
 	currentAddr = addr
 	if addr != "" {
 		token := uuid.New()
 		csrfToken := token.String()
 		webpage := bytes.ReplaceAll(webpage, []byte("csrfToken"), []byte(csrfToken))
-		conns = make(chan *websocket.Conn, 256)
-		server = &http.Server{
+		connections := make(chan *websocket.Conn, 256)
+		conns = connections
+		newServer := &http.Server{
 			Addr: addr,
 			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/websocket" {
-					if r.URL.Query().Get("token") == csrfToken {
-						if conn, err := upgrader.Upgrade(w, r, nil); err == nil {
-							conns <- conn
-						} else {
-							errors.LogError(context.Background(), "Browser dialer http upgrade unexpected error")
+					if r.URL.Query().Get("token") != csrfToken {
+						w.WriteHeader(http.StatusForbidden)
+						return
+					}
+					if conn, err := upgrader.Upgrade(w, r, nil); err == nil {
+						mu.Lock()
+						if conns != connections {
+							mu.Unlock()
+							conn.Close()
+							return
 						}
+						select {
+						case connections <- conn:
+							mu.Unlock()
+						default:
+							mu.Unlock()
+							conn.Close()
+						}
+					} else {
+						errors.LogError(context.Background(), "Browser dialer http upgrade unexpected error")
 					}
 				} else {
 					w.Header().Set("Access-Control-Allow-Origin", "*")
-					w.Write(webpage)
+					_, _ = w.Write(webpage)
 				}
 			}),
 		}
-		go server.ListenAndServe()
+		listener, err := stdnet.Listen("tcp", addr)
+		if err != nil {
+			conns = nil
+			close(connections)
+			errors.LogErrorInner(context.Background(), err, "Browser dialer failed to listen on ", addr)
+			return
+		}
+		server = newServer
+		browserListener = listener
+		go func() {
+			err := newServer.Serve(listener)
+			_ = listener.Close()
+			if err == nil || stderrors.Is(err, http.ErrServerClosed) {
+				return
+			}
+			errors.LogErrorInner(context.Background(), err, "Browser dialer server stopped unexpectedly")
+
+			mu.Lock()
+			defer mu.Unlock()
+			if server != newServer || browserListener != listener || conns != connections {
+				return
+			}
+			server = nil
+			browserListener = nil
+			conns = nil
+			for len(connections) > 0 {
+				select {
+				case conn := <-connections:
+					conn.Close()
+				default:
+				}
+			}
+			close(connections)
+		}()
 	}
 }
 
 func HasBrowserDialer() bool {
+	mu.Lock()
+	defer mu.Unlock()
 	return conns != nil
 }
 
@@ -102,6 +164,13 @@ type webSocketExtra struct {
 }
 
 func DialWS(uri string, ed []byte) (*websocket.Conn, error) {
+	return DialWSContext(context.Background(), uri, ed)
+}
+
+// DialWSContext uses ctx to cancel browser assignment and the upstream
+// WebSocket handshake. As with net.Dialer, cancellation stops setup only; a
+// successfully returned connection is owned by its caller.
+func DialWSContext(ctx context.Context, uri string, ed []byte) (*websocket.Conn, error) {
 	task := task{
 		Method:         "WS",
 		URL:            uri,
@@ -112,7 +181,15 @@ func DialWS(uri string, ed []byte) (*websocket.Conn, error) {
 		Protocol: base64.RawURLEncoding.EncodeToString(ed),
 	}
 
-	return dialTask(task)
+	conn, err := dialTaskContext(ctx, task)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return conn, nil
 }
 
 type httpExtra struct {
@@ -122,7 +199,7 @@ type httpExtra struct {
 }
 
 func httpExtraFromHeadersAndCookies(headers http.Header, cookies []*http.Cookie) *httpExtra {
-	if len(headers) == 0 {
+	if len(headers) == 0 && len(cookies) == 0 {
 		return nil
 	}
 
@@ -150,6 +227,10 @@ func httpExtraFromHeadersAndCookies(headers http.Header, cookies []*http.Cookie)
 }
 
 func DialGet(uri string, headers http.Header, cookies []*http.Cookie) (*websocket.Conn, error) {
+	return DialGetContext(context.Background(), uri, headers, cookies)
+}
+
+func DialGetContext(ctx context.Context, uri string, headers http.Header, cookies []*http.Cookie) (*websocket.Conn, error) {
 	task := task{
 		Method:         "GET",
 		URL:            uri,
@@ -157,14 +238,26 @@ func DialGet(uri string, headers http.Header, cookies []*http.Cookie) (*websocke
 		StreamResponse: true,
 	}
 
-	return dialTask(task)
+	conn, err := dialTaskContext(ctx, task)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	// A streaming fetch belongs to the returned logical connection. Keep
+	// cancellation attached after the task handshake so closing that logical
+	// connection aborts both the websocket and the browser-side fetch.
+	context.AfterFunc(ctx, func() { conn.Close() })
+	return conn, nil
 }
 
 func DialPacket(method string, uri string, headers http.Header, cookies []*http.Cookie, payload []byte) error {
-	return dialWithBody(method, uri, headers, cookies, payload)
+	return DialPacketContext(context.Background(), method, uri, headers, cookies, payload)
 }
 
-func dialWithBody(method string, uri string, headers http.Header, cookies []*http.Cookie, payload []byte) error {
+func DialPacketContext(ctx context.Context, method string, uri string, headers http.Header, cookies []*http.Cookie, payload []byte) error {
 	task := task{
 		Method:         method,
 		URL:            uri,
@@ -172,46 +265,90 @@ func dialWithBody(method string, uri string, headers http.Header, cookies []*htt
 		StreamResponse: false,
 	}
 
-	conn, err := dialTask(task)
+	conn, err := dialTaskContext(ctx, task)
 	if err != nil {
 		return err
 	}
+	stopCancellation := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stopCancellation()
+	defer conn.Close()
 
 	err = conn.WriteMessage(websocket.BinaryMessage, payload)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return err
 	}
 
 	err = CheckOK(conn)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return err
 	}
 
-	conn.Close()
 	return nil
 }
 
-func dialTask(task task) (*websocket.Conn, error) {
-	data, err := json.Marshal(task)
-	if err != nil {
-		return nil, err
-	}
-
-	var conn *websocket.Conn
+func dialTaskContext(ctx context.Context, task task) (*websocket.Conn, error) {
 	for {
-		conn = <-conns
-		if conn.WriteMessage(websocket.TextMessage, data) != nil {
+		mu.Lock()
+		connections := conns
+		mu.Unlock()
+		if connections == nil {
+			return nil, errors.New("browser dialer is not available")
+		}
+
+		var conn *websocket.Conn
+		select {
+		case conn = <-connections:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+
+		// Reload closes the old queue while publishing a new generation. Validate
+		// after receiving so an idle websocket removed from the old queue cannot
+		// escape its drain and be assigned after the reload linearizes.
+		mu.Lock()
+		currentGeneration := conns == connections
+		mu.Unlock()
+		if !currentGeneration {
+			if conn != nil {
+				conn.Close()
+			}
+			continue
+		}
+		if conn == nil {
+			return nil, errors.New("browser dialer connection queue closed")
+		}
+		data, err := json.Marshal(task)
+		if err != nil {
 			conn.Close()
+			return nil, err
+		}
+
+		stopCancellation := context.AfterFunc(ctx, func() { conn.Close() })
+		if conn.WriteMessage(websocket.TextMessage, data) != nil {
+			stopCancellation()
+			conn.Close()
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 		} else {
-			break
+			err = CheckOK(conn)
+			stopCancellation()
+			if ctx.Err() != nil {
+				conn.Close()
+				return nil, ctx.Err()
+			}
+			if err != nil {
+				return nil, err
+			}
+			return conn, nil
 		}
 	}
-	err = CheckOK(conn)
-	if err != nil {
-		return nil, err
-	}
-
-	return conn, nil
 }
 
 func CheckOK(conn *websocket.Conn) error {

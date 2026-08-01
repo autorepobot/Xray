@@ -15,9 +15,44 @@
 		let upstreamGetCount = 0;
 		let upstreamWsCount = 0;
 		let upstreamPostCount = 0;
+		let cookieGateReaders = 0;
+		let cookieGateWriter = false;
+		const cookieGateQueue = [];
+		const maxControlReconnectFailures = 5;
+		const maxControlReconnectDelayMs = 8000;
+		const stableControlConnectionMs = 15000;
+		let controlReconnectFailures = 0;
+		let controlReconnectAfter = 0;
+		let controlReconnectSuspended = false;
+
+		function resetControlReconnect() {
+			controlReconnectFailures = 0;
+			controlReconnectAfter = 0;
+			controlReconnectSuspended = false;
+		}
+
+		function deferControlReconnect() {
+			controlReconnectFailures += 1;
+			if (controlReconnectFailures >= maxControlReconnectFailures) {
+				controlReconnectSuspended = true;
+				console.error("Browser Dialer control connection repeatedly failed; reload the page to retry");
+				return;
+			}
+			const ceiling = Math.min(
+				1000 * (2 ** (controlReconnectFailures - 1)),
+				maxControlReconnectDelayMs,
+			);
+			// Equal jitter prevents many stale tabs from retrying in lockstep.
+			const delay = Math.floor(ceiling / 2 + Math.random() * ceiling / 2);
+			controlReconnectAfter = Date.now() + delay;
+		}
 
 		function prepareRequestInit(extra) {
+			extra = extra || {};
 			const requestInit = {};
+			if (extra.cookies) {
+				requestInit.credentials = "include";
+			}
 			if (extra.referrer) {
 				// note: we have to strip the protocol and host part.
 				// Browsers disallow that, and will reset the value to current page if attempted.
@@ -30,15 +65,11 @@
 				requestInit.headers = extra.headers;
 			}
 
-			if (extra.cookies) {
-				requestInit.credentials = 'include';
-			}
-
 			return requestInit;
 		}
 
 		function setCookiesFromTask(task) {
-			if (!task.extra.cookies) {
+			if (!task.extra || !task.extra.cookies) {
 				return;
 			}
 
@@ -50,7 +81,7 @@
 		}
 
 		function clearCookiesFromTask(task) {
-			if (!task.extra.cookies) {
+			if (!task.extra || !task.extra.cookies) {
 				return;
 			}
 
@@ -61,56 +92,254 @@
 			}
 		}
 
+		function cookieGateAbortReason(signal) {
+			return signal && signal.reason ? signal.reason : new DOMException("cookie gate wait aborted", "AbortError");
+		}
+
+		function drainCookieGate() {
+			if (cookieGateWriter || cookieGateQueue.length === 0) {
+				return;
+			}
+			if (cookieGateQueue[0].kind === "write") {
+				if (cookieGateReaders !== 0) {
+					return;
+				}
+				cookieGateWriter = true;
+				grantCookieGateWaiter(cookieGateQueue.shift());
+				return;
+			}
+			// Admit the whole reader batch at the head of the FIFO. Once a writer
+			// is queued, later readers cannot overtake it.
+			while (cookieGateQueue.length > 0 && cookieGateQueue[0].kind === "read") {
+				cookieGateReaders += 1;
+				grantCookieGateWaiter(cookieGateQueue.shift());
+			}
+		}
+
+		function grantCookieGateWaiter(waiter) {
+			waiter.granted = true;
+			if (waiter.signal) {
+				waiter.signal.removeEventListener("abort", waiter.abort);
+			}
+			let released = false;
+			waiter.resolve(() => {
+				if (released) {
+					return;
+				}
+				released = true;
+				if (waiter.kind === "write") {
+					cookieGateWriter = false;
+				} else {
+					cookieGateReaders -= 1;
+				}
+				drainCookieGate();
+			});
+		}
+
+		function acquireCookieGate(kind, signal) {
+			return new Promise((resolve, reject) => {
+				if (signal && signal.aborted) {
+					reject(cookieGateAbortReason(signal));
+					return;
+				}
+				const waiter = { kind, signal, resolve, reject, granted: false, abort: null };
+				waiter.abort = () => {
+					if (waiter.granted) {
+						return;
+					}
+					const index = cookieGateQueue.indexOf(waiter);
+					if (index >= 0) {
+						cookieGateQueue.splice(index, 1);
+					}
+					reject(cookieGateAbortReason(signal));
+					drainCookieGate();
+				};
+				if (signal) {
+					signal.addEventListener("abort", waiter.abort, { once: true });
+				}
+				cookieGateQueue.push(waiter);
+				drainCookieGate();
+			});
+		}
+
+		async function withDocumentCookieGate(kind, signal, operation) {
+			const release = await acquireCookieGate(kind, signal);
+			try {
+				if (signal && signal.aborted) {
+					throw cookieGateAbortReason(signal);
+				}
+				return await operation();
+			} finally {
+				release();
+			}
+		}
+
+		async function withCookieGate(kind, signal, operation) {
+			const runInDocument = () => withDocumentCookieGate(kind, signal, operation);
+			// The local FIFO gate covers every task in this page. Web Locks extends
+			// the same shared/exclusive policy across tabs of the same origin and is
+			// automatically released if a page crashes. Browser Dialer commonly runs
+			// on a trustworthy localhost or HTTPS origin; older/non-secure browsers
+			// retain the compatible per-document fallback.
+			if (window.isSecureContext && navigator.locks) {
+				return await navigator.locks.request(
+					"xray-browser-dialer-cookie-jar",
+					{ mode: kind === "read" ? "shared" : "exclusive", signal },
+					runInDocument,
+				);
+			}
+			return await runInDocument();
+		}
+
+		async function fetchWithTaskCookies(task, requestInit, signal) {
+			if (!task.extra || !task.extra.cookies) {
+				// Ordinary requests retain the browser's original same-origin
+				// credential behavior, so coordinate them as readers.
+				return await withCookieGate("read", signal, () => fetch(task.url, requestInit));
+			}
+
+			// Temporary task cookies require exclusive access until fetch has captured
+			// the full request (including redirects) and returned response headers.
+			return await withCookieGate("write", signal, async () => {
+				try {
+					setCookiesFromTask(task);
+					return await fetch(task.url, requestInit);
+				} finally {
+					clearCookiesFromTask(task);
+				}
+			});
+		}
+
+		async function openWebSocketWithCookieIsolation(task, bridge) {
+			// WebSocket cannot suppress ambient cookies. A shared gate prevents a
+			// temporary XHTTP cookie writer from overlapping the opening handshake,
+			// while allowing all ordinary WebSocket handshakes to proceed in parallel.
+			const controller = new AbortController();
+			let upstream = null;
+			let settled = false;
+			let rejectHandshake = null;
+			const fail = (error) => {
+				controller.abort();
+				if (!settled) {
+					settled = true;
+					if (rejectHandshake) {
+						rejectHandshake(error || new Error("upstream WebSocket handshake failed"));
+					}
+				}
+				if (upstream && upstream.readyState < WebSocket.CLOSING) {
+					upstream.close();
+				}
+			};
+			bridge.onclose = () => fail(new Error("browser bridge closed during WebSocket handshake"));
+
+			return await withCookieGate("read", controller.signal, () => new Promise((resolve, reject) => {
+				rejectHandshake = reject;
+				if (bridge.readyState !== WebSocket.OPEN) {
+					fail(new Error("browser bridge closed before WebSocket handshake"));
+					return;
+				}
+				try {
+					upstream = new WebSocket(task.url, task.extra.protocol);
+				} catch (error) {
+					fail(error);
+					return;
+				}
+				upstream.binaryType = "arraybuffer";
+				upstream.onerror = () => fail(new Error("upstream WebSocket emitted an error during handshake"));
+				upstream.onclose = (event) => fail(new Error("upstream WebSocket closed during handshake: code=" + event.code + " reason=" + event.reason));
+				upstream.onopen = () => {
+					if (bridge.readyState !== WebSocket.OPEN) {
+						fail(new Error("browser bridge closed after WebSocket handshake"));
+						return;
+					}
+					if (!settled) {
+						settled = true;
+						resolve(upstream);
+					}
+				};
+			}));
+		}
+
 		let check = function () {
-			if (clientIdleCount > 0) {
+			if (clientIdleCount > 0 || controlReconnectSuspended || Date.now() < controlReconnectAfter) {
 				return;
 			}
 			clientIdleCount += 1;
 			console.log("Prepare", url);
 			let ws = new WebSocket(url);
+			let assigned = false;
+			let stableTimer = null;
 			// arraybuffer is significantly faster in chrome than default
 			// blob, tested with chrome 123
 			ws.binaryType = "arraybuffer";
+			ws.onopen = function () {
+				// An immediately rejected/full-queue socket must still count as a
+				// failure. A genuinely stable idle bridge starts a fresh recovery
+				// budget even if it has not received a task yet.
+				stableTimer = setTimeout(() => {
+					if (!assigned && ws.readyState === WebSocket.OPEN) {
+						resetControlReconnect();
+					}
+				}, stableControlConnectionMs);
+			};
+			// A socket can be rejected by a server reload, a full queue, or a
+			// network failure before it receives a task. Retry with a finite,
+			// jittered backoff so recovery cannot become a permanent request loop.
+			ws.onclose = function (event) {
+				if (!assigned) {
+					assigned = true;
+					clearTimeout(stableTimer);
+					clientIdleCount -= 1;
+					deferControlReconnect();
+				}
+			};
 			// note: this event listener is later overwritten after the
 			// handshake has completed. do not attempt to modernize it without
 			// double-checking that this continues to work
 			ws.onmessage = function (event) {
+				assigned = true;
+				clearTimeout(stableTimer);
+				resetControlReconnect();
 				clientIdleCount -= 1;
 				let task = JSON.parse(event.data);
 				if (task.method == "WS") {
-					upstreamWsCount += 1;
-					console.log("Dial WS", task.url, task.extra.protocol);
-					const wss = new WebSocket(task.url, task.extra.protocol);
-					wss.binaryType = "arraybuffer";
-					let opened = false;
-					ws.onmessage = function (event) {
-						wss.send(event.data)
-					};
-					wss.onopen = function (event) {
-						opened = true;
-						ws.send("ok")
-					};
-					wss.onmessage = function (event) {
-						ws.send(event.data)
-					};
-					wss.onclose = function (event) {
-						upstreamWsCount -= 1;
-						console.log("Dial WS DONE, remaining: ", upstreamWsCount);
-						ws.close()
-					};
-					wss.onerror = function (event) {
-						!opened && ws.send("fail")
-						wss.close()
-					};
-					ws.onclose = function (event) {
-						wss.close()
-					};
+					(async () => {
+						upstreamWsCount += 1;
+						let finished = false;
+						let wss = null;
+						const finish = () => {
+							if (!finished) {
+								finished = true;
+								upstreamWsCount -= 1;
+								console.log("Dial WS DONE, remaining: ", upstreamWsCount);
+							}
+						};
+						try {
+							console.log("Dial WS", task.url, task.extra.protocol);
+							wss = await openWebSocketWithCookieIsolation(task, ws);
+							ws.onmessage = (event) => wss.send(event.data);
+							wss.onmessage = (event) => ws.send(event.data);
+							wss.onclose = () => {
+								finish();
+								ws.close();
+							};
+							wss.onerror = () => wss.close();
+							ws.onclose = () => wss.close();
+							ws.send("ok");
+						} catch (error) {
+							finish();
+							if (wss && wss.readyState < WebSocket.CLOSING) wss.close();
+							try { ws.send("fail: " + String(error)); } catch (ignored) {}
+							ws.close();
+						}
+					})();
 				}
 				else if (task.method == "GET" && task.streamResponse) {
 					(async () => {
 						const requestInit = prepareRequestInit(task.extra);
 
 						console.log("Dial GET", task.url);
+						// Preserve the original Browser Dialer setup acknowledgement.
 						ws.send("ok");
 						const controller = new AbortController();
 
@@ -141,9 +370,7 @@
 							upstreamGetCount += 1;
 
 							requestInit.signal = controller.signal;
-							setCookiesFromTask(task);
-							const response = await fetch(task.url, requestInit);
-							clearCookiesFromTask(task);
+							const response = await fetchWithTaskCookies(task, requestInit, controller.signal);
 
 							const body = await response.body;
 							reader = body.getReader();
@@ -167,15 +394,16 @@
 					requestInit.method = task.method;
 
 					console.log("Dial", task.method, task.url);
+					const controller = new AbortController();
+					requestInit.signal = controller.signal;
+					ws.onclose = () => controller.abort();
 					ws.send("ok");
 					ws.onmessage = async (event) => {
 						try {
 							if (event.data.byteLength > 0) {
 								requestInit.body = event.data;
 							}
-							setCookiesFromTask(task);
-							const response = await fetch(task.url, requestInit);
-							clearCookiesFromTask(task);
+							const response = await fetchWithTaskCookies(task, requestInit, controller.signal);
 							if (response.ok) {
 								ws.send("ok");
 							} else {
@@ -201,6 +429,10 @@
 			};
 		};
 		let checkTask = setInterval(check, 1000);
+		window.addEventListener("online", () => {
+			resetControlReconnect();
+			check();
+		});
 	</script>
 </body>
 </html>

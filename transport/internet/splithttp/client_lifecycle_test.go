@@ -214,6 +214,28 @@ func TestPostPacketTreats200HeadersAsAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestBrowserPacketRejectsFetchMethodWithBody(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			client := &BrowserDialerClient{transportConfig: &Config{
+				UplinkHTTPMethod:    method,
+				UplinkDataPlacement: PlacementBody,
+			}}
+			payload := buf.New()
+			if _, err := payload.Write([]byte("payload")); err != nil {
+				t.Fatal(err)
+			}
+			err := client.PostPacket(context.Background(), "https://example.test/upload", "session", "0", buf.MultiBuffer{payload})
+			if err == nil || !strings.Contains(err.Error(), "cannot send a request body") {
+				t.Fatalf("PostPacket error = %v, want browser request-body rejection", err)
+			}
+			if payload.Len() != 0 {
+				t.Fatalf("rejected packet retained %d payload bytes", payload.Len())
+			}
+		})
+	}
+}
+
 func TestPostPacketDoesNotFollowRedirect(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -278,6 +300,20 @@ func TestPostPacketDoesNotAddAbsoluteDeadline(t *testing.T) {
 	}
 	if <-observed {
 		t.Fatal("PostPacket added an absolute deadline to the session context")
+	}
+}
+
+func TestBrowserPostPacketReleasesPayloadWhenRequestCreationFails(t *testing.T) {
+	payload := buf.New()
+	if _, err := payload.Write([]byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+	client := &BrowserDialerClient{transportConfig: &Config{UplinkHTTPMethod: "BAD METHOD"}}
+	if err := client.PostPacket(context.Background(), "https://example.test/upload", "session", "0", buf.MultiBuffer{payload}); err == nil {
+		t.Fatal("invalid HTTP method unexpectedly succeeded")
+	}
+	if payload.Len() != 0 {
+		t.Fatalf("failed Browser packet request retained %d payload bytes", payload.Len())
 	}
 }
 
