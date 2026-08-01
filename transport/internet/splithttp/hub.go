@@ -5,6 +5,7 @@ import (
 	"context"
 	gotls "crypto/tls"
 	"encoding/base64"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,7 +26,6 @@ import (
 	http_proto "github.com/xtls/xray-core/common/protocol/http"
 	"github.com/xtls/xray-core/common/signal/done"
 	"github.com/xtls/xray-core/transport/internet"
-	"github.com/xtls/xray-core/transport/internet/hysteria/congestion"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/bbr"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -52,6 +52,37 @@ type httpSession struct {
 	isFullyConnected *done.Instance
 }
 
+const sessionReapTimeout = 30 * time.Second
+
+func (h *requestHandler) connectSession(sessionId string, session *httpSession) bool {
+	h.sessionMu.Lock()
+	defer h.sessionMu.Unlock()
+	current, ok := h.sessions.Load(sessionId)
+	if !ok || current != session || session.isFullyConnected.Done() {
+		return false
+	}
+	session.isFullyConnected.Close()
+	return true
+}
+
+func (h *requestHandler) reapSessionIfUnconnected(sessionId string, session *httpSession) bool {
+	// The timer and the GET-side signal may both be ready when this goroutine is
+	// finally scheduled. Serialize the state check and map deletion with the
+	// GET-side transition so neither can pass a check and then lose a TOCTOU race.
+	h.sessionMu.Lock()
+	if session.isFullyConnected.Done() {
+		h.sessionMu.Unlock()
+		return false
+	}
+	// Do not delete a newer session that happens to reuse the same identifier.
+	removed := h.sessions.CompareAndDelete(sessionId, session)
+	h.sessionMu.Unlock()
+	if removed {
+		session.uploadQueue.Close()
+	}
+	return removed
+}
+
 func (h *requestHandler) upsertSession(sessionId string) *httpSession {
 	// fast path
 	currentSessionAny, ok := h.sessions.Load(sessionId)
@@ -75,17 +106,13 @@ func (h *requestHandler) upsertSession(sessionId string) *httpSession {
 
 	h.sessions.Store(sessionId, s)
 
-	shouldReap := done.New()
 	go func() {
-		time.Sleep(30 * time.Second)
-		shouldReap.Close()
-	}()
-	go func() {
+		timer := time.NewTimer(sessionReapTimeout)
+		defer timer.Stop()
 		select {
-		case <-shouldReap.Wait():
-			h.sessions.Delete(sessionId)
-			s.uploadQueue.Close()
 		case <-s.isFullyConnected.Wait():
+		case <-timer.C:
+			h.reapSessionIfUnconnected(sessionId, s)
 		}
 	}()
 
@@ -222,9 +249,18 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 						for {
 							_, err := httpSC.Write(bytes.Repeat([]byte{'X'}, int(h.config.GetNormalizedXPaddingBytes().rand())))
 							if err != nil {
-								break
+								return
 							}
-							time.Sleep(time.Duration(scStreamUpServerSecs.rand()) * time.Second)
+							timer := time.NewTimer(time.Duration(scStreamUpServerSecs.rand()) * time.Second)
+							select {
+							case <-timer.C:
+							case <-httpSC.Wait():
+								timer.Stop()
+								return
+							case <-request.Context().Done():
+								timer.Stop()
+								return
+							}
 						}
 					}()
 				}
@@ -349,8 +385,12 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		if sessionId != "" {
 			// after GET is done, the connection is finished. disable automatic
 			// session reaping, and handle it in defer
-			currentSession.isFullyConnected.Close()
-			defer h.sessions.Delete(sessionId)
+			if !h.connectSession(sessionId, currentSession) {
+				errors.LogInfo(context.Background(), "session is already connected or expired")
+				writer.WriteHeader(http.StatusConflict)
+				return
+			}
+			defer h.sessions.CompareAndDelete(sessionId, currentSession)
 		}
 
 		// magic header instructs nginx + apache to not buffer response body
@@ -430,16 +470,34 @@ func (c *httpServerConn) Close() error {
 
 type Listener struct {
 	sync.Mutex
-	server     http.Server
-	h3server   *http3.Server
-	listener   net.Listener
-	h3listener http3.QUICListener
-	config     *Config
-	addConn    internet.ConnHandler
-	isH3       bool
+	server       http.Server
+	h3server     *http3.Server
+	listener     net.Listener
+	h3listener   http3.QUICListener
+	h3PacketConn net.PacketConn
+	config       *Config
+	addConn      internet.ConnHandler
+	isH3         bool
+	closeOnce    sync.Once
+	closeErr     error
+}
+
+func listenQUICEarlyOwned(conn net.PacketConn, tlsConfig *gotls.Config, quicConfig *quic.Config) (http3.QUICListener, error) {
+	listener, err := quic.ListenEarly(conn, tlsConfig, quicConfig)
+	if err != nil {
+		// A QUIC listener never takes ownership when construction fails. Keep
+		// PacketConn ownership local to this helper so future callers can't miss
+		// the initialization-error cleanup branch.
+		_ = conn.Close()
+		return nil, err
+	}
+	return listener, nil
 }
 
 func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, addConn internet.ConnHandler) (internet.Listener, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	l := &Listener{
 		addConn: addConn,
 	}
@@ -472,7 +530,18 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 		}
 		errors.LogInfo(ctx, "listening UNIX domain socket for XHTTP on ", address)
 	} else if l.isH3 { // quic
-		Conn, err := internet.ListenSystemPacket(context.Background(), &net.UDPAddr{
+		quicParams := streamSettings.QuicParams
+		if quicParams == nil {
+			quicParams = &internet.QuicParams{
+				BbrProfile: string(bbr.ProfileStandard),
+				UdpHop:     &internet.UdpHop{},
+			}
+		}
+		if err := validateH3Congestion(quicParams); err != nil {
+			return nil, err
+		}
+
+		Conn, err := internet.ListenSystemPacket(ctx, &net.UDPAddr{
 			IP:   address.IP(),
 			Port: int(port),
 		}, streamSettings.SocketSettings)
@@ -488,14 +557,6 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 			Conn = newConn
 		}
 
-		quicParams := streamSettings.QuicParams
-		if quicParams == nil {
-			quicParams = &internet.QuicParams{
-				BbrProfile: string(bbr.ProfileStandard),
-				UdpHop:     &internet.UdpHop{},
-			}
-		}
-
 		quicConfig := &quic.Config{
 			InitialStreamReceiveWindow:     quicParams.InitStreamReceiveWindow,
 			MaxStreamReceiveWindow:         quicParams.MaxStreamReceiveWindow,
@@ -506,10 +567,11 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 			DisablePathMTUDiscovery:        quicParams.DisablePathMtuDiscovery || (runtime.GOOS != "linux" && runtime.GOOS != "windows" && runtime.GOOS != "darwin"),
 		}
 
-		l.h3listener, err = quic.ListenEarly(Conn, tlsConfig, quicConfig)
+		l.h3listener, err = listenQUICEarlyOwned(Conn, tlsConfig, quicConfig)
 		if err != nil {
 			return nil, errors.New("failed to listen QUIC for XHTTP/3 on ", address, ":", port).Base(err)
 		}
+		l.h3PacketConn = Conn
 		l.h3listener = &QListener{
 			QUICListener: l.h3listener,
 			quicParams:   quicParams,
@@ -520,11 +582,19 @@ func ListenXH(ctx context.Context, address net.Address, port net.Port, streamSet
 
 		l.h3server = &http3.Server{
 			Handler: handler,
+			// Preserve http3.Server's 1 MiB zero-value default unless the user
+			// explicitly requests a different limit. H1/H2 retain XHTTP's legacy
+			// normalized 8 KiB default below.
+			MaxHeaderBytes: int(l.config.ServerMaxHeaderBytes),
 		}
 		go func() {
-			if err := l.h3server.ServeListener(l.h3listener); err != nil {
+			if err := l.h3server.ServeListener(l.h3listener); err != nil && !stderrors.Is(err, http.ErrServerClosed) {
 				errors.LogErrorInner(ctx, err, "failed to serve HTTP/3 for XHTTP/3")
 			}
+			// ServeListener doesn't own either the supplied listener or its
+			// PacketConn. An unexpected Accept failure must use the same cleanup
+			// path as an explicit Listener.Close.
+			_ = l.Close()
 		}()
 	} else { // tcp
 		l.listener, err = internet.ListenSystem(ctx, &net.TCPAddr{
@@ -587,12 +657,32 @@ func (ln *Listener) Addr() net.Addr {
 
 // Close implements net.Listener.Close().
 func (ln *Listener) Close() error {
-	if ln.h3server != nil {
-		return ln.h3server.Close()
-	} else if ln.listener != nil {
-		return ln.listener.Close()
-	}
-	return errors.New("listener does not have an HTTP/3 server or a net.listener")
+	ln.closeOnce.Do(func() {
+		if ln.h3server != nil || ln.h3listener != nil || ln.h3PacketConn != nil {
+			// http3.Server.Close stops active requests but deliberately leaves an
+			// externally supplied listener open. The QUIC listener in turn doesn't
+			// own the PacketConn passed to quic.ListenEarly, so all three layers
+			// must be closed, in that order, to release the UDP socket.
+			var closeErrors []error
+			if ln.h3server != nil {
+				closeErrors = append(closeErrors, ln.h3server.Close())
+			}
+			if ln.h3listener != nil {
+				closeErrors = append(closeErrors, ln.h3listener.Close())
+			}
+			if ln.h3PacketConn != nil {
+				closeErrors = append(closeErrors, ln.h3PacketConn.Close())
+			}
+			ln.closeErr = stderrors.Join(closeErrors...)
+			return
+		}
+		if ln.listener != nil {
+			ln.closeErr = ln.listener.Close()
+			return
+		}
+		ln.closeErr = errors.New("listener does not have an HTTP/3 server or a net.listener")
+	})
+	return ln.closeErr
 }
 
 func getTLSConfig(streamSettings *internet.MemoryStreamConfig) *gotls.Config {
@@ -617,14 +707,9 @@ func (l *QListener) Accept(ctx context.Context) (*quic.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	switch l.quicParams.Congestion {
-	case "reno":
-	case "", "bbr":
-		congestion.UseBBR(conn, bbr.Profile(l.quicParams.BbrProfile))
-	case "force-brutal":
-		congestion.UseBrutal(conn, l.quicParams.BrutalUp)
-	default:
-		panic(l.quicParams.Congestion)
+	if err := configureH3Congestion(conn, l.quicParams); err != nil {
+		_ = conn.CloseWithError(0, "")
+		return nil, err
 	}
 	return conn, nil
 }
