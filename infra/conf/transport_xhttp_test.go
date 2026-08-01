@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	. "github.com/xtls/xray-core/infra/conf"
+	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/splithttp"
 )
 
@@ -26,6 +27,15 @@ func assertProtoRange(t *testing.T, name string, got *splithttp.RangeConfig, fro
 	if got == nil || got.From != from || got.To != to {
 		t.Fatalf("%s = %#v, want %d-%d", name, got, from, to)
 	}
+}
+
+func buildStream(t *testing.T, input string) (*internet.StreamConfig, error) {
+	t.Helper()
+	config := new(StreamConfig)
+	if err := json.Unmarshal([]byte(input), config); err != nil {
+		return nil, err
+	}
+	return config.Build()
 }
 
 func TestSplitHTTPXmuxEmptyDefersProtocolDefaults(t *testing.T) {
@@ -290,6 +300,57 @@ func TestSplitHTTPRejectsNonPositivePostSize(t *testing.T) {
 	}
 	if got := built.GetNormalizedScMaxEachPostBytes(); got.From != 1000000 || got.To != 1000000 {
 		t.Fatalf("default scMaxEachPostBytes = %#v, want 1000000", got)
+	}
+}
+
+func TestXHTTPBuildDefersH3OnlyCongestionValidation(t *testing.T) {
+	_, err := buildStream(t, `{
+		"network":"xhttp",
+		"xhttpSettings":{},
+		"finalmask":{"quicParams":{"congestion":"brutal","brutalUp":"1m"}}
+	}`)
+	if err != nil {
+		t.Fatalf("H1/H2 XHTTP config was rejected by an H3-only validation: %v", err)
+	}
+}
+
+func TestStreamConfigDefersXHTTPUDPHopValidationUntilH3(t *testing.T) {
+	for _, interval := range []string{`"0-10"`, `"4-30"`} {
+		input := `{
+			"network":"xhttp",
+			"xhttpSettings":{},
+			"finalmask":{"quicParams":{"udpHop":{"ports":443,"interval":` + interval + `}}}
+		}`
+		if _, err := buildStream(t, input); err != nil {
+			t.Fatalf("H1/H2 XHTTP config was rejected by an H3-only UDP hop validation for %s: %v", interval, err)
+		}
+	}
+
+	if _, err := buildStream(t, `{
+		"network":"hysteria",
+		"hysteriaSettings":{"version":2},
+		"finalmask":{"quicParams":{"udpHop":{"ports":443,"interval":"0-10"}}}
+	}`); err == nil {
+		t.Fatal("Hysteria accepted an invalid effective UDP hop interval")
+	}
+
+	for _, interval := range []string{`0`, `"5-30"`, `"0-30"`} {
+		input := `{
+			"network":"hysteria",
+			"hysteriaSettings":{"version":2},
+			"finalmask":{"quicParams":{"udpHop":{"ports":443,"interval":` + interval + `}}}
+		}`
+		if _, err := buildStream(t, input); err != nil {
+			t.Fatalf("valid Hysteria UDP hop interval %s failed: %v", interval, err)
+		}
+	}
+
+	if _, err := buildStream(t, `{
+		"network":"xhttp",
+		"xhttpSettings":{},
+		"finalmask":{"quicParams":{"udpHop":{"interval":"0-10"}}}
+	}`); err != nil {
+		t.Fatalf("unused UDP hop interval was rejected: %v", err)
 	}
 }
 

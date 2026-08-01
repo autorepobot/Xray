@@ -8,6 +8,7 @@ import (
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/bbr"
+	"github.com/xtls/xray-core/transport/internet/hysteria/udphop"
 )
 
 type TransportProtocol string
@@ -244,7 +245,7 @@ func (c *StreamConfig) Build() (*internet.StreamConfig, error) {
 
 			c.FinalMask.QuicParams.Congestion = strings.ToLower(c.FinalMask.QuicParams.Congestion)
 			switch c.FinalMask.QuicParams.Congestion {
-			case "", "brutal", "reno", "bbr":
+			case "", "reno", "bbr", "brutal":
 			case "force-brutal":
 				if up == 0 {
 					return nil, errors.New("force-brutal requires up")
@@ -253,8 +254,16 @@ func (c *StreamConfig) Build() (*internet.StreamConfig, error) {
 				return nil, errors.New("unknown congestion control: ", c.FinalMask.QuicParams.Congestion, ", valid values: reno, bbr, brutal, force-brutal")
 			}
 
-			if (c.FinalMask.QuicParams.UdpHop.Interval.From != 0 && c.FinalMask.QuicParams.UdpHop.Interval.From < 5) || (c.FinalMask.QuicParams.UdpHop.Interval.To != 0 && c.FinalMask.QuicParams.UdpHop.Interval.To < 5) {
-				return nil, errors.New("Interval must be at least 5")
+			udpHopPorts := c.FinalMask.QuicParams.UdpHop.PortList.Build().Ports()
+			// Hysteria always consumes quicParams, so reject an invalid effective
+			// interval while building its configuration. XHTTP may resolve to H1,
+			// H2, or H3 only after TLS/REALITY settings are available; its H3 dial
+			// path validates the interval when port hopping is actually enabled.
+			// This keeps unused H1/H2 metadata from becoming a startup failure.
+			if config.ProtocolName == "hysteria" && len(udpHopPorts) > 0 {
+				if _, _, err := udphop.NormalizeIntervals(int64(c.FinalMask.QuicParams.UdpHop.Interval.From), int64(c.FinalMask.QuicParams.UdpHop.Interval.To)); err != nil {
+					return nil, errors.New("invalid UDP hop interval").Base(err)
+				}
 			}
 
 			if c.FinalMask.QuicParams.InitStreamReceiveWindow > 0 && c.FinalMask.QuicParams.InitStreamReceiveWindow < 16384 {
@@ -290,7 +299,7 @@ func (c *StreamConfig) Build() (*internet.StreamConfig, error) {
 				BrutalUp:   up,
 				BrutalDown: down,
 				UdpHop: &internet.UdpHop{
-					Ports:       c.FinalMask.QuicParams.UdpHop.PortList.Build().Ports(),
+					Ports:       udpHopPorts,
 					IntervalMin: int64(c.FinalMask.QuicParams.UdpHop.Interval.From),
 					IntervalMax: int64(c.FinalMask.QuicParams.UdpHop.Interval.To),
 				},
