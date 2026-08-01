@@ -3,7 +3,6 @@ package splithttp
 import (
 	"encoding/base64"
 	"fmt"
-	"io"
 	"math/rand/v2"
 	"net/http"
 	"strings"
@@ -340,7 +339,7 @@ func (c *Config) FillPacketRequest(request *http.Request, sessionId string, seqS
 
 	if dataPlacement == PlacementBody || dataPlacement == PlacementAuto {
 		request.Header = c.GetRequestHeader()
-		request.Body = io.NopCloser(&buf.MultiBufferContainer{MultiBuffer: payload})
+		request.Body = &buf.MultiBufferContainer{MultiBuffer: payload}
 		request.ContentLength = int64(payload.Len())
 	} else {
 		data := make([]byte, payload.Len())

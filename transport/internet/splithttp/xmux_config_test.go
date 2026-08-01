@@ -1,8 +1,12 @@
 package splithttp
 
 import (
+	"context"
+	"net/http"
 	"testing"
 
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/tls"
 )
@@ -204,6 +208,7 @@ func TestDecideHTTPVersionForXmuxDefaults(t *testing.T) {
 		{name: "cleartext", want: "1.1"},
 		{name: "TLS default", tls: &tls.Config{}, want: "2"},
 		{name: "TLS multiple ALPN", tls: &tls.Config{NextProtocol: []string{"h2", "http/1.1"}}, want: "2"},
+		{name: "TLS custom H2 token", tls: &tls.Config{NextProtocol: []string{"custom-h2"}}, want: "2"},
 		{name: "explicit H1", tls: &tls.Config{NextProtocol: []string{"http/1.1"}}, want: "1.1"},
 		{name: "explicit H3", tls: &tls.Config{NextProtocol: []string{"h3"}}, want: "3"},
 		{name: "REALITY", tls: &tls.Config{NextProtocol: []string{"h3"}}, reality: &reality.Config{}, want: "2"},
@@ -214,5 +219,85 @@ func TestDecideHTTPVersionForXmuxDefaults(t *testing.T) {
 				t.Fatalf("decideHTTPVersion() = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestManagersResolveMainAndDownloadALPNIndependently(t *testing.T) {
+	dest := net.TCPDestination(net.DomainAddress("defaults.example"), 443)
+	h2Memory := &internet.MemoryStreamConfig{
+		ProtocolName:     protocolName,
+		ProtocolSettings: &Config{},
+		SecurityType:     "tls",
+		SecuritySettings: &tls.Config{NextProtocol: []string{"h2"}},
+	}
+	h3Memory := &internet.MemoryStreamConfig{
+		ProtocolName:     protocolName,
+		ProtocolSettings: &Config{},
+		SecurityType:     "tls",
+		SecuritySettings: &tls.Config{NextProtocol: []string{"h3"}},
+	}
+
+	globalDialerAccess.Lock()
+	oldMap := globalDialerMap
+	globalDialerMap = nil
+	globalDialerAccess.Unlock()
+	t.Cleanup(func() {
+		globalDialerAccess.Lock()
+		globalDialerMap = oldMap
+		globalDialerAccess.Unlock()
+	})
+
+	h2Manager, _ := getHTTPClientManager(dest, h2Memory)
+	h3Manager, _ := getHTTPClientManager(dest, h3Memory)
+	if h2Manager == nil || h3Manager == nil {
+		t.Skip("browser dialer bypasses native XMUX managers")
+	}
+	assertRange(t, "main H2 maxConcurrency", h2Manager.xmuxConfig.MaxConcurrency, 32, 64)
+	assertRange(t, "main H2 maxConnections", h2Manager.xmuxConfig.MaxConnections, 3, 3)
+	assertRange(t, "download H3 maxConcurrency", h3Manager.xmuxConfig.MaxConcurrency, 64, 96)
+	assertRange(t, "download H3 maxConnections", h3Manager.xmuxConfig.MaxConnections, 2, 2)
+}
+
+func TestH1ManagerSharesPacketPoolAcrossWrappers(t *testing.T) {
+	dest := net.TCPDestination(net.DomainAddress("h1-pool.example"), 80)
+	memory := &internet.MemoryStreamConfig{
+		ProtocolName: protocolName,
+		ProtocolSettings: &Config{Xmux: &XmuxConfig{
+			MaxConcurrency: &RangeConfig{From: 1, To: 1},
+			MaxConnections: &RangeConfig{From: 2, To: 2},
+		}},
+	}
+
+	globalDialerAccess.Lock()
+	oldMap := globalDialerMap
+	globalDialerMap = nil
+	globalDialerAccess.Unlock()
+	t.Cleanup(func() {
+		globalDialerAccess.Lock()
+		globalDialerMap = oldMap
+		globalDialerAccess.Unlock()
+	})
+
+	manager, _ := getHTTPClientManager(dest, memory)
+	if manager == nil {
+		t.Skip("browser dialer bypasses native XMUX managers")
+	}
+	first := manager.AcquireSession(context.Background())
+	second := manager.AcquireSession(context.Background())
+	defer first.Release()
+	defer second.Release()
+	firstClient := first.Client().XmuxConn.(*DefaultDialerClient)
+	secondClient := second.Client().XmuxConn.(*DefaultDialerClient)
+	if firstClient == secondClient {
+		t.Fatal("test did not create two H1 wrappers")
+	}
+	if firstClient.packetClient == nil || firstClient.packetClient != secondClient.packetClient {
+		t.Fatal("H1 wrappers do not share one bounded packet-up pool")
+	}
+	if firstClient.packetClient.Transport.(*http.Transport).MaxConnsPerHost != h1MaxConnections {
+		t.Fatal("shared H1 packet-up pool does not enforce the physical connection cap")
+	}
+	if !manager.hasH1PacketDownAdmission() {
+		t.Fatal("built-in H1 manager did not enable packet-down admission")
 	}
 }
