@@ -136,15 +136,18 @@ func (c *Config) GetNormalizedUplinkHTTPMethod() string {
 	return c.UplinkHTTPMethod
 }
 
+const defaultScMaxEachPostBytes int32 = 1000000
+
 func (c *Config) GetNormalizedScMaxEachPostBytes() *RangeConfig {
-	if c.ScMaxEachPostBytes == nil || c.ScMaxEachPostBytes.To == 0 {
+	configured := c.ScMaxEachPostBytes
+	if configured == nil || configured.From <= 0 || configured.To <= 0 || configured.From > configured.To {
 		return &RangeConfig{
-			From: 1000000,
-			To:   1000000,
+			From: defaultScMaxEachPostBytes,
+			To:   defaultScMaxEachPostBytes,
 		}
 	}
 
-	return c.ScMaxEachPostBytes
+	return configured
 }
 
 func (c *Config) GetNormalizedScMinPostsIntervalMs() *RangeConfig {
@@ -158,27 +161,33 @@ func (c *Config) GetNormalizedScMinPostsIntervalMs() *RangeConfig {
 	return c.ScMinPostsIntervalMs
 }
 
+const defaultScMaxBufferedPosts = 30
+
 func (c *Config) GetNormalizedScMaxBufferedPosts() int {
-	if c.ScMaxBufferedPosts == 0 {
-		return 30
+	// JSON validation rejects negative and platform-sized overflow values. Keep
+	// direct protobuf/API construction defensive as well: neither case may be
+	// allowed to reach make(chan, capacity) and panic the server.
+	if c.ScMaxBufferedPosts <= 0 || uint64(c.ScMaxBufferedPosts) > uint64(^uint(0)>>1) {
+		return defaultScMaxBufferedPosts
 	}
 
 	return int(c.ScMaxBufferedPosts)
 }
 
 func (c *Config) GetNormalizedScStreamUpServerSecs() *RangeConfig {
-	if c.ScStreamUpServerSecs == nil || c.ScStreamUpServerSecs.To == 0 {
+	configured := c.ScStreamUpServerSecs
+	if configured == nil || (configured.From == 0 && configured.To == 0) || configured.From > configured.To || (configured.From <= 0 && configured.To > 0) {
 		return &RangeConfig{
 			From: 20,
 			To:   80,
 		}
 	}
 
-	return c.ScStreamUpServerSecs
+	return configured
 }
 
 func (c *Config) GetNormalizedUplinkChunkSize() *RangeConfig {
-	if c.UplinkChunkSize == nil || c.UplinkChunkSize.To == 0 {
+	if c.UplinkChunkSize == nil || (c.UplinkChunkSize.From == 0 && c.UplinkChunkSize.To == 0) {
 		switch c.UplinkDataPlacement {
 		case PlacementCookie:
 			return &RangeConfig{
@@ -193,14 +202,13 @@ func (c *Config) GetNormalizedUplinkChunkSize() *RangeConfig {
 		default:
 			return c.GetNormalizedScMaxEachPostBytes()
 		}
-	} else if c.UplinkChunkSize.From < 64 {
-		return &RangeConfig{
-			From: 64,
-			To:   max(64, c.UplinkChunkSize.To),
-		}
 	}
 
-	return c.UplinkChunkSize
+	from, to := c.UplinkChunkSize.From, c.UplinkChunkSize.To
+	if from > to {
+		from, to = to, from
+	}
+	return &RangeConfig{From: max(64, from), To: max(64, to)}
 }
 
 func (c *Config) GetNormalizedServerMaxHeaderBytes() int {
@@ -503,13 +511,19 @@ var PredefinedTable = map[string]string{
 	"number":   "0123456789",
 }
 
+// MaxSessionIDLength is a resource-safety ceiling for locally generated
+// identifiers. It matches net/http's default maximum header budget while still
+// allowing deployments that explicitly raise XHTTP's legacy 8 KiB H1/H2
+// serverMaxHeaderBytes limit (and H3's larger zero-value default).
+const MaxSessionIDLength int32 = 1 << 20
+
 func (c *Config) GenerateSessionID() string {
 	length := c.SessionIDLength.rand()
 	table := c.SessionIDTable
 	if predefined, ok := PredefinedTable[table]; ok {
 		table = predefined
 	}
-	if table != "" && length > 0 {
+	if table != "" && length > 0 && length <= MaxSessionIDLength {
 		id := make([]byte, length)
 		for i := range id {
 			id[i] = table[rand.N(len(table))]

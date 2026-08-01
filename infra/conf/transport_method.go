@@ -3,7 +3,6 @@ package conf
 import (
 	"context"
 	"encoding/json"
-	"math/big"
 	"net/url"
 	"sort"
 	"strconv"
@@ -409,18 +408,34 @@ func (c *SplitHTTPConfig) Build() (proto.Message, error) {
 		if predefined, ok := splithttp.PredefinedTable[c.SessionIDTable]; ok {
 			c.SessionIDTable = predefined
 		}
-		room := roomSize(len(c.SessionIDTable), c.SessionIDLength.From, c.SessionIDLength.To)
-		// 2.1B possiblities should be enough
-		if room.Cmp(big.NewInt(2<<30)) < 0 {
-			return nil, errors.New("sessionIDTable or sessionIDLength is too small")
-		}
 		if c.SessionIDLength.From <= 0 {
 			return nil, errors.New("sessionIDLength.from must be greater than 0")
 		}
+		maxGeneratedLength := c.SessionIDLength.To
+		if c.SessionIDLength.From < maxGeneratedLength {
+			maxGeneratedLength--
+		}
+		if maxGeneratedLength > splithttp.MaxSessionIDLength {
+			return nil, errors.New("sessionIDLength must not exceed ", splithttp.MaxSessionIDLength)
+		}
+		var seen [128]bool
+		uniqueCharacters := 0
 		for i := 0; i < len(c.SessionIDTable); i++ {
 			if c.SessionIDTable[i] >= 0x80 {
 				return nil, errors.New("sessionIDTable must contain only ASCII characters")
 			}
+			if !seen[c.SessionIDTable[i]] {
+				seen[c.SessionIDTable[i]] = true
+				uniqueCharacters++
+			}
+		}
+		// RangeConfig.rand uses [From, To) for a non-scalar range. Match the
+		// lengths that can actually be generated rather than crediting the excluded
+		// upper endpoint with entropy it never provides.
+		// 2.1B possible values is enough. Calculate only up to the target so a
+		// hostile length cannot make config loading build enormous big.Int values.
+		if !sessionIDSpaceAtLeast(uniqueCharacters, c.SessionIDLength.From, maxGeneratedLength, 2<<30) {
+			return nil, errors.New("sessionIDTable or sessionIDLength is too small")
 		}
 	}
 
@@ -444,6 +459,18 @@ func (c *SplitHTTPConfig) Build() (proto.Message, error) {
 
 	if c.ServerMaxHeaderBytes < 0 {
 		return nil, errors.New("invalid negative value of maxHeaderBytes")
+	}
+	if c.ScMaxEachPostBytes != (Int32Range{}) && (c.ScMaxEachPostBytes.From <= 0 || c.ScMaxEachPostBytes.To <= 0) {
+		return nil, errors.New("scMaxEachPostBytes must be a positive integer or range")
+	}
+	if c.ScStreamUpServerSecs != (Int32Range{}) && (c.ScStreamUpServerSecs.From > c.ScStreamUpServerSecs.To || (c.ScStreamUpServerSecs.From <= 0 && c.ScStreamUpServerSecs.To > 0)) {
+		return nil, errors.New("scStreamUpServerSecs must be a positive range, a negative off range, or 0 for the default")
+	}
+	if c.ScMaxBufferedPosts < 0 {
+		return nil, errors.New("scMaxBufferedPosts must not be negative")
+	}
+	if c.ScMaxBufferedPosts > int64(^uint(0)>>1) {
+		return nil, errors.New("scMaxBufferedPosts exceeds the platform int capacity")
 	}
 
 	if c.Xmux.MaxConnections.To > 0 && c.Xmux.MaxConcurrency.To > 0 {
@@ -504,20 +531,45 @@ func (c *SplitHTTPConfig) Build() (proto.Message, error) {
 		if config.DownloadSettings, err = c.DownloadSettings.Build(); err != nil {
 			return nil, errors.New(`Failed to build "downloadSettings".`).Base(err)
 		}
+		if config.DownloadSettings.ProtocolName != "splithttp" {
+			return nil, errors.New(`"downloadSettings" must use the XHTTP transport`)
+		}
+		if config.DownloadSettings.Address == nil {
+			return nil, errors.New(`"downloadSettings" requires an address`)
+		}
+		if config.DownloadSettings.Port == 0 {
+			return nil, errors.New(`"downloadSettings" requires a non-zero port`)
+		}
 	}
 
 	return config, nil
 }
 
-func roomSize(tableSize int, min, max int32) *big.Int {
-	base := big.NewInt(int64(tableSize))
-	sum := new(big.Int)
-	term := new(big.Int)
-	for k := min; k <= max; k++ {
-		term.Exp(base, big.NewInt(int64(k)), nil)
-		sum.Add(sum, term)
+func sessionIDSpaceAtLeast(tableSize int, minLength, maxLength int32, target uint64) bool {
+	if tableSize <= 0 || minLength <= 0 || maxLength < minLength || target == 0 {
+		return false
 	}
-	return sum
+
+	base := uint64(tableSize)
+	power := uint64(1)
+	total := uint64(0)
+	for length := int32(0); length <= maxLength; length++ {
+		if length > 0 {
+			if power >= target/base {
+				power = target
+			} else {
+				power *= base
+			}
+		}
+		if length < minLength {
+			continue
+		}
+		if power >= target-total {
+			return true
+		}
+		total += power
+	}
+	return false
 }
 
 type KCPConfig struct {

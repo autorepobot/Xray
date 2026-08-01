@@ -77,3 +77,40 @@ func Test_GetNormalizedPath(t *testing.T) {
 		})
 	}
 }
+
+func TestInvalidDirectPostSizeFallsBackToDefault(t *testing.T) {
+	for _, configured := range []*RangeConfig{
+		{From: -1, To: -1},
+		{From: 0, To: 5},
+		{From: 10, To: 5},
+	} {
+		got := (&Config{ScMaxEachPostBytes: configured}).GetNormalizedScMaxEachPostBytes()
+		if got.From != 1000000 || got.To != 1000000 {
+			t.Fatalf("normalized invalid range %#v = %#v, want 1000000", configured, got)
+		}
+	}
+}
+
+func TestDirectRangeConfigurationIsMadeSafe(t *testing.T) {
+	streamSecs := (&Config{ScStreamUpServerSecs: &RangeConfig{From: 0, To: 1}}).GetNormalizedScStreamUpServerSecs()
+	if streamSecs.From != 20 || streamSecs.To != 80 {
+		t.Fatalf("cross-zero stream padding interval = %#v, want default 20-80", streamSecs)
+	}
+	offSecs := (&Config{ScStreamUpServerSecs: &RangeConfig{From: -2, To: -1}}).GetNormalizedScStreamUpServerSecs()
+	if offSecs.From != -2 || offSecs.To != -1 {
+		t.Fatalf("negative stream padding interval = %#v, want off range", offSecs)
+	}
+
+	chunkSize := (&Config{UplinkChunkSize: &RangeConfig{From: 100, To: -1}}).GetNormalizedUplinkChunkSize()
+	if chunkSize.From != 64 || chunkSize.To != 100 {
+		t.Fatalf("reversed direct chunk range = %#v, want clamped 64-100", chunkSize)
+	}
+
+	sessionConfig := &Config{
+		SessionIDTable:  "ab",
+		SessionIDLength: &RangeConfig{From: MaxSessionIDLength + 1, To: MaxSessionIDLength + 1},
+	}
+	if got := sessionConfig.GenerateSessionID(); len(got) != 36 {
+		t.Fatalf("unsafe direct session length generated %d bytes, want UUID fallback", len(got))
+	}
+}
