@@ -485,6 +485,111 @@ func (m *XmuxConfig) GetNormalizedHMaxReusableSecs() *RangeConfig {
 	return m.HMaxReusableSecs
 }
 
+func cloneRangeConfig(value *RangeConfig) *RangeConfig {
+	if value == nil {
+		return nil
+	}
+	return &RangeConfig{From: value.From, To: value.To}
+}
+
+func xmuxRangeBounds(value *RangeConfig) (int32, int32) {
+	from, to := value.From, value.To
+	if from > to {
+		from, to = to, from
+	}
+	return from, to
+}
+
+func isAutoRange(value *RangeConfig) bool {
+	if value == nil {
+		return true
+	}
+	from, to := xmuxRangeBounds(value)
+	// RangeConfig.rand samples [from, to), so 0-1 is exactly the auto
+	// sentinel rather than a range that can produce a positive limit.
+	return from == 0 && to <= 1
+}
+
+func isNegativeRange(value *RangeConfig) bool {
+	if value == nil {
+		return false
+	}
+	from, to := xmuxRangeBounds(value)
+	// A half-open range ending at zero still samples only negative values.
+	return from < 0 && to <= 0
+}
+
+func isValidXmuxLimit(value *RangeConfig) bool {
+	if isAutoRange(value) {
+		return true
+	}
+	if isNegativeRange(value) {
+		return true
+	}
+	from, _ := xmuxRangeBounds(value)
+	return from > 0
+}
+
+func xmuxDefaultsForHTTPVersion(httpVersion string) (*RangeConfig, *RangeConfig) {
+	switch httpVersion {
+	case "1.1", "http/1.1":
+		// An H1 XmuxClient is a transport/pool wrapper, not a TCP connection.
+		// Keep one wrapper and control packet uploads in the H1 socket pool.
+		return &RangeConfig{From: -1, To: -1}, &RangeConfig{From: 1, To: 1}
+	case "3", "h3":
+		return &RangeConfig{From: 64, To: 96}, &RangeConfig{From: 2, To: 2}
+	default: // H2, REALITY, and unknown future callers use the conservative H2 policy.
+		return &RangeConfig{From: 32, To: 64}, &RangeConfig{From: 3, To: 3}
+	}
+}
+
+func resolveXmuxLimit(value, fallback *RangeConfig) *RangeConfig {
+	if isAutoRange(value) {
+		return cloneRangeConfig(fallback)
+	}
+	// The documented off value is -1. Older XHTTP accepted any wholly negative
+	// scalar/range and all such samples followed the same non-positive branch;
+	// canonicalize those legacy aliases without changing their behavior.
+	if isNegativeRange(value) {
+		return &RangeConfig{From: -1, To: -1}
+	}
+	if !isValidXmuxLimit(value) {
+		return cloneRangeConfig(fallback)
+	}
+	return cloneRangeConfig(value)
+}
+
+func resolveOptionalXmuxRange(value, fallback *RangeConfig) *RangeConfig {
+	if value == nil {
+		return cloneRangeConfig(fallback)
+	}
+	return cloneRangeConfig(value)
+}
+
+// resolveXmuxConfig turns the public 0=auto/-1=off representation into the
+// effective per-protocol scheduler settings without modifying the shared
+// protobuf config. The optional hMax fields resolve independently: an omitted
+// message gets its historical default while an explicit zero message retains
+// the established unlimited behavior. Positive protobuf values are always
+// explicit; an old precompiled config whose builder injected maxConnections=3
+// must be rebuilt from JSON to opt into auto defaults because the wire format
+// has no field-presence bit that can distinguish it.
+func resolveXmuxConfig(value *XmuxConfig, httpVersion string) *XmuxConfig {
+	defaultConcurrency, defaultConnections := xmuxDefaultsForHTTPVersion(httpVersion)
+	if value == nil {
+		value = &XmuxConfig{}
+	}
+	resolved := &XmuxConfig{
+		MaxConcurrency:   resolveXmuxLimit(value.MaxConcurrency, defaultConcurrency),
+		MaxConnections:   resolveXmuxLimit(value.MaxConnections, defaultConnections),
+		CMaxReuseTimes:   cloneRangeConfig(value.CMaxReuseTimes),
+		HMaxRequestTimes: resolveOptionalXmuxRange(value.HMaxRequestTimes, &RangeConfig{From: 600, To: 900}),
+		HMaxReusableSecs: resolveOptionalXmuxRange(value.HMaxReusableSecs, &RangeConfig{From: 1800, To: 3000}),
+		HKeepAlivePeriod: value.HKeepAlivePeriod,
+	}
+	return resolved
+}
+
 func init() {
 	common.Must(internet.RegisterProtocolConfigCreator(protocolName, func() interface{} {
 		return new(Config)

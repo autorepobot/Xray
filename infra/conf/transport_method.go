@@ -293,6 +293,86 @@ type XmuxConfig struct {
 	HMaxRequestTimes Int32Range `json:"hMaxRequestTimes"`
 	HMaxReusableSecs Int32Range `json:"hMaxReusableSecs"`
 	HKeepAlivePeriod int64      `json:"hKeepAlivePeriod"`
+
+	hMaxRequestTimesSet bool
+	hMaxReusableSecsSet bool
+}
+
+func (c *XmuxConfig) UnmarshalJSON(data []byte) error {
+	// Keep the public value fields source-compatible while recording the two
+	// places where an omitted value and an explicit zero now have distinct
+	// meanings. Decode into the existing value so repeated Unmarshal calls retain
+	// fields omitted by a later JSON object, matching encoding/json semantics.
+	type plain XmuxConfig
+	decoded := plain(*c)
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*c = XmuxConfig(decoded)
+	for name := range fields {
+		switch {
+		case strings.EqualFold(name, "hMaxRequestTimes"):
+			c.hMaxRequestTimesSet = true
+		case strings.EqualFold(name, "hMaxReusableSecs"):
+			c.hMaxReusableSecsSet = true
+		}
+	}
+	return nil
+}
+
+func (c XmuxConfig) MarshalJSON() ([]byte, error) {
+	// Do not turn an omitted hMax field into an explicit zero during a JSON
+	// round-trip. Nonzero values created directly by Go callers remain explicit.
+	type encodedXmuxConfig struct {
+		MaxConcurrency   Int32Range  `json:"maxConcurrency"`
+		MaxConnections   Int32Range  `json:"maxConnections"`
+		CMaxReuseTimes   Int32Range  `json:"cMaxReuseTimes"`
+		HMaxRequestTimes *Int32Range `json:"hMaxRequestTimes,omitempty"`
+		HMaxReusableSecs *Int32Range `json:"hMaxReusableSecs,omitempty"`
+		HKeepAlivePeriod int64       `json:"hKeepAlivePeriod"`
+	}
+
+	var hMaxRequestTimes, hMaxReusableSecs *Int32Range
+	if c.hMaxRequestTimesSet || c.HMaxRequestTimes != (Int32Range{}) {
+		hMaxRequestTimes = &c.HMaxRequestTimes
+	}
+	if c.hMaxReusableSecsSet || c.HMaxReusableSecs != (Int32Range{}) {
+		hMaxReusableSecs = &c.HMaxReusableSecs
+	}
+	return json.Marshal(&encodedXmuxConfig{
+		MaxConcurrency:   c.MaxConcurrency,
+		MaxConnections:   c.MaxConnections,
+		CMaxReuseTimes:   c.CMaxReuseTimes,
+		HMaxRequestTimes: hMaxRequestTimes,
+		HMaxReusableSecs: hMaxReusableSecs,
+		HKeepAlivePeriod: c.HKeepAlivePeriod,
+	})
+}
+
+// validateXmuxLimit validates the two limits that make up the XMUX scheduler.
+// Zero means "auto", -1 is the canonical spelling that disables that
+// scheduling dimension, and a positive scalar or range is an explicit value.
+// Upstream historically treated every negative result as disabled, so retain
+// wholly negative scalars/ranges as legacy aliases. Range sampling is
+// half-open, so "-3-0" only produces negative values and "0-1" only produces
+// zero; accept both without widening their historical meaning. Ranges whose
+// sampled values span different scheduler meanings are rejected.
+func validateXmuxLimit(name string, value Int32Range) error {
+	if value.From == 0 && value.To <= 1 {
+		return nil
+	}
+	if value.From < 0 && value.To <= 0 {
+		return nil
+	}
+	if value.From <= 0 {
+		return errors.New(name + " must be 0 (auto), a negative off value, or a positive integer range")
+	}
+	return nil
 }
 
 func newRangeConfig(input Int32Range) *splithttp.RangeConfig {
@@ -300,6 +380,24 @@ func newRangeConfig(input Int32Range) *splithttp.RangeConfig {
 		From: input.From,
 		To:   input.To,
 	}
+}
+
+func defaultInt32Range(from, to int32) Int32Range {
+	return Int32Range{Left: from, Right: to, From: from, To: to}
+}
+
+func (c XmuxConfig) normalizedHMaxRequestTimes() Int32Range {
+	if c.hMaxRequestTimesSet || c.HMaxRequestTimes != (Int32Range{}) {
+		return c.HMaxRequestTimes
+	}
+	return defaultInt32Range(600, 900)
+}
+
+func (c XmuxConfig) normalizedHMaxReusableSecs() Int32Range {
+	if c.hMaxReusableSecsSet || c.HMaxReusableSecs != (Int32Range{}) {
+		return c.HMaxReusableSecs
+	}
+	return defaultInt32Range(1800, 3000)
 }
 
 // Build implements Buildable.
@@ -473,18 +571,12 @@ func (c *SplitHTTPConfig) Build() (proto.Message, error) {
 		return nil, errors.New("scMaxBufferedPosts exceeds the platform int capacity")
 	}
 
-	if c.Xmux.MaxConnections.To > 0 && c.Xmux.MaxConcurrency.To > 0 {
-		return nil, errors.New("maxConnections cannot be specified together with maxConcurrency")
+	if err := validateXmuxLimit("maxConcurrency", c.Xmux.MaxConcurrency); err != nil {
+		return nil, err
 	}
-	if c.Xmux == (XmuxConfig{}) {
-		c.Xmux.MaxConnections.From = 3
-		c.Xmux.MaxConnections.To = 3
-		c.Xmux.HMaxRequestTimes.From = 600
-		c.Xmux.HMaxRequestTimes.To = 900
-		c.Xmux.HMaxReusableSecs.From = 1800
-		c.Xmux.HMaxReusableSecs.To = 3000
+	if err := validateXmuxLimit("maxConnections", c.Xmux.MaxConnections); err != nil {
+		return nil, err
 	}
-
 	config := &splithttp.Config{
 		Host:                 c.Host,
 		Path:                 c.Path,
@@ -517,8 +609,8 @@ func (c *SplitHTTPConfig) Build() (proto.Message, error) {
 			MaxConcurrency:   newRangeConfig(c.Xmux.MaxConcurrency),
 			MaxConnections:   newRangeConfig(c.Xmux.MaxConnections),
 			CMaxReuseTimes:   newRangeConfig(c.Xmux.CMaxReuseTimes),
-			HMaxRequestTimes: newRangeConfig(c.Xmux.HMaxRequestTimes),
-			HMaxReusableSecs: newRangeConfig(c.Xmux.HMaxReusableSecs),
+			HMaxRequestTimes: newRangeConfig(c.Xmux.normalizedHMaxRequestTimes()),
+			HMaxReusableSecs: newRangeConfig(c.Xmux.normalizedHMaxReusableSecs()),
 			HKeepAlivePeriod: c.Xmux.HKeepAlivePeriod,
 		},
 	}
