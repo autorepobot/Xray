@@ -50,20 +50,10 @@ func NewUDPHopPacketConn(addrs []net.Addr, hopIntervalMin time.Duration, hopInte
 	if len(addrs) == 0 {
 		panic("len(addrs) == 0")
 	}
-	if hopIntervalMin == 0 {
-		hopIntervalMin = defaultHopInterval
-	}
-	if hopIntervalMax == 0 {
-		hopIntervalMax = defaultHopInterval
-	}
-	if hopIntervalMin < 5*time.Second {
-		panic("hopIntervalMin < 5*time.Second")
-	}
-	if hopIntervalMax < 5*time.Second {
-		panic("hopIntervalMax < 5*time.Second")
-	}
-	if hopIntervalMax < hopIntervalMin {
-		panic("hopIntervalMax < hopIntervalMin")
+	var err error
+	hopIntervalMin, hopIntervalMax, err = normalizeIntervals(hopIntervalMin, hopIntervalMax)
+	if err != nil {
+		panic(err)
 	}
 	if listenUDPFunc == nil {
 		panic("listenUDPFunc is nil")
