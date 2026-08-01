@@ -9,6 +9,8 @@ import (
 	stderrors "errors"
 	stdnet "net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +28,7 @@ type task struct {
 	URL            string `json:"url"`
 	Extra          any    `json:"extra,omitempty"`
 	StreamResponse bool   `json:"streamResponse"`
+	Strict         bool   `json:"strict,omitempty"`
 }
 
 var (
@@ -33,25 +36,116 @@ var (
 	server          *http.Server
 	browserListener stdnet.Listener
 	currentAddr     string
+	currentStrict   bool
 	mu              sync.Mutex
 )
 
-var upgrader = &websocket.Upgrader{
-	ReadBufferSize:   0,
-	WriteBufferSize:  0,
-	HandshakeTimeout: time.Second * 4,
-	CheckOrigin: func(*http.Request) bool {
+func newBrowserDialerUpgrader(strict bool) *websocket.Upgrader {
+	return &websocket.Upgrader{
+		ReadBufferSize:   0,
+		WriteBufferSize:  0,
+		HandshakeTimeout: time.Second * 4,
+		CheckOrigin: func(request *http.Request) bool {
+			return !strict || browserDialerSameOrigin(request)
+		},
+	}
+}
+
+// Keep the package-level upgrader permissive for external users and tests that
+// historically reused it. Each Browser Dialer server generation owns an
+// immutable policy-specific upgrader created by Reload.
+var upgrader = newBrowserDialerUpgrader(false)
+
+func browserDialerSameOrigin(request *http.Request) bool {
+	origins := request.Header.Values("Origin")
+	if len(origins) == 0 {
+		// Preserve non-browser clients and tests; browsers always send Origin on
+		// a WebSocket handshake.
 		return true
-	},
+	}
+	if len(origins) != 1 {
+		return false
+	}
+	origin, err := url.Parse(origins[0])
+	return err == nil && origin.Host != "" && strings.EqualFold(origin.Host, request.Host)
+}
+
+func authorityHostname(authority string) (string, bool) {
+	if host, _, err := stdnet.SplitHostPort(authority); err == nil {
+		return strings.TrimSuffix(strings.ToLower(host), "."), true
+	}
+	if strings.HasPrefix(authority, "[") && strings.HasSuffix(authority, "]") {
+		return strings.ToLower(strings.TrimSuffix(strings.Trim(authority, "[]"), ".")), true
+	}
+	if authority == "" || strings.Contains(authority, ":") {
+		return "", false
+	}
+	return strings.TrimSuffix(strings.ToLower(authority), "."), true
+}
+
+func hostIP(host string) stdnet.IP {
+	// An IPv6 zone is local routing metadata rather than part of the address.
+	if i := strings.LastIndexByte(host, '%'); i >= 0 {
+		host = host[:i]
+	}
+	return stdnet.ParseIP(host)
+}
+
+func browserDialerHostAllowed(requestHost, listenAddr string) bool {
+	listenHost, _, err := stdnet.SplitHostPort(listenAddr)
+	if err != nil {
+		return false
+	}
+	listenHost = strings.TrimSuffix(strings.ToLower(listenHost), ".")
+	requestHostname, ok := authorityHostname(requestHost)
+	if !ok {
+		return false
+	}
+
+	listenIP := hostIP(listenHost)
+	requestIP := hostIP(requestHostname)
+	switch {
+	case listenHost == "" || (listenIP != nil && listenIP.IsUnspecified()):
+		// A wildcard bind has no trustworthy DNS name. Literal IP authorities
+		// cannot be DNS-rebound; localhost is reserved for loopback use.
+		return requestIP != nil || requestHostname == "localhost"
+	case listenHost == "localhost" || (listenIP != nil && listenIP.IsLoopback()):
+		return requestHostname == "localhost" || (requestIP != nil && requestIP.IsLoopback())
+	case listenIP != nil:
+		return requestIP != nil && listenIP.Equal(requestIP)
+	default:
+		// A non-IP hostname is allowed only when the user explicitly bound it.
+		return strings.EqualFold(requestHostname, listenHost)
+	}
+}
+
+func serveBrowserDialerPage(writer http.ResponseWriter, request *http.Request, page []byte, strict bool) {
+	if strict && request.Method != http.MethodGet && request.Method != http.MethodHead {
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
+	writer.Header().Set("Cache-Control", "no-store")
+	writer.Header().Set("X-Content-Type-Options", "nosniff")
+	if !strict {
+		// Compatibility mode preserves the original Browser Dialer page policy.
+		writer.Header().Set("Access-Control-Allow-Origin", "*")
+	}
+	if request.Method == http.MethodHead {
+		writer.WriteHeader(http.StatusOK)
+		return
+	}
+	_, _ = writer.Write(page)
 }
 
 // Used by external projects when using xray as a go module
 func Reload() {
 	addr := platform.NewEnvFlag(platform.BrowserDialerAddress).GetValue(func() string { return "" })
+	strict := strings.EqualFold(strings.TrimSpace(platform.NewEnvFlag(platform.BrowserDialerStrict).GetValue(func() string { return "" })), "true")
 	mu.Lock()
 	defer mu.Unlock()
 
-	if addr == currentAddr && (addr == "" || server != nil) {
+	if addr == currentAddr && strict == currentStrict && (addr == "" || server != nil) {
 		return
 	}
 
@@ -79,21 +173,27 @@ func Reload() {
 		close(connections)
 	}
 	currentAddr = addr
+	currentStrict = strict
 	if addr != "" {
 		token := uuid.New()
 		csrfToken := token.String()
 		webpage := bytes.ReplaceAll(webpage, []byte("csrfToken"), []byte(csrfToken))
 		connections := make(chan *websocket.Conn, 256)
+		generationUpgrader := newBrowserDialerUpgrader(strict)
 		conns = connections
 		newServer := &http.Server{
 			Addr: addr,
 			Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strict && !browserDialerHostAllowed(r.Host, addr) {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
 				if r.URL.Path == "/websocket" {
 					if r.URL.Query().Get("token") != csrfToken {
 						w.WriteHeader(http.StatusForbidden)
 						return
 					}
-					if conn, err := upgrader.Upgrade(w, r, nil); err == nil {
+					if conn, err := generationUpgrader.Upgrade(w, r, nil); err == nil {
 						mu.Lock()
 						if conns != connections {
 							mu.Unlock()
@@ -111,8 +211,7 @@ func Reload() {
 						errors.LogError(context.Background(), "Browser dialer http upgrade unexpected error")
 					}
 				} else {
-					w.Header().Set("Access-Control-Allow-Origin", "*")
-					_, _ = w.Write(webpage)
+					serveBrowserDialerPage(w, r, webpage, strict)
 				}
 			}),
 		}
@@ -313,6 +412,7 @@ func dialTaskContext(ctx context.Context, task task) (*websocket.Conn, error) {
 		// escape its drain and be assigned after the reload linearizes.
 		mu.Lock()
 		currentGeneration := conns == connections
+		strict := currentStrict
 		mu.Unlock()
 		if !currentGeneration {
 			if conn != nil {
@@ -323,6 +423,7 @@ func dialTaskContext(ctx context.Context, task task) (*websocket.Conn, error) {
 		if conn == nil {
 			return nil, errors.New("browser dialer connection queue closed")
 		}
+		task.Strict = strict
 		data, err := json.Marshal(task)
 		if err != nil {
 			conn.Close()

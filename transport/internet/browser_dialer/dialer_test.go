@@ -70,6 +70,16 @@ func TestDialTaskContextRetriesAfterQueueGenerationChanges(t *testing.T) {
 	oldConnections := make(chan *websocket.Conn)
 	newConnections := make(chan *websocket.Conn, 1)
 	useTestConnections(t, oldConnections)
+	mu.Lock()
+	previousStrict := currentStrict
+	currentStrict = true
+	mu.Unlock()
+	t.Cleanup(func() {
+		mu.Lock()
+		currentStrict = previousStrict
+		mu.Unlock()
+	})
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	result := make(chan *websocket.Conn, 1)
@@ -113,8 +123,8 @@ func TestDialTaskContextRetriesAfterQueueGenerationChanges(t *testing.T) {
 	if err := json.Unmarshal(taskData, &deliveredTask); err != nil {
 		t.Fatal(err)
 	}
-	if deliveredTask.Method != "GET" {
-		t.Fatalf("delivered task method = %q, want GET", deliveredTask.Method)
+	if !deliveredTask.Strict {
+		t.Fatal("dial task did not carry the current strict policy to an existing browser page")
 	}
 	if err := browserConn.WriteMessage(websocket.TextMessage, []byte("ok")); err != nil {
 		t.Fatal(err)
@@ -140,6 +150,159 @@ func TestHTTPExtraPreservesCookiesWithoutHeaders(t *testing.T) {
 	if got := extra.Cookies["session"]; got != "secret" {
 		t.Fatalf("session cookie = %q, want secret", got)
 	}
+}
+
+func TestBrowserDialerWebSocketRequiresSameOrigin(t *testing.T) {
+	tests := []struct {
+		name   string
+		origin string
+		want   bool
+	}{
+		{name: "browser same origin", origin: "http://127.0.0.1:8080", want: true},
+		{name: "browser cross origin", origin: "https://attacker.example", want: false},
+		{name: "non-browser without origin", want: true},
+		{name: "opaque origin", origin: "null", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/websocket", nil)
+			request.Host = "127.0.0.1:8080"
+			if test.origin != "" {
+				request.Header.Set("Origin", test.origin)
+			}
+			if got := browserDialerSameOrigin(request); got != test.want {
+				t.Fatalf("browserDialerSameOrigin() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestBrowserDialerOriginPolicyDefaultsToCompatibility(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/websocket", nil)
+	request.Host = "127.0.0.1:8080"
+	request.Header.Set("Origin", "https://attacker.example")
+	if !newBrowserDialerUpgrader(false).CheckOrigin(request) {
+		t.Fatal("compatibility policy rejected the historically accepted Origin")
+	}
+	if newBrowserDialerUpgrader(true).CheckOrigin(request) {
+		t.Fatal("strict policy accepted a cross-origin browser handshake")
+	}
+}
+
+func TestBrowserDialerHostPolicyRejectsDNSRebinding(t *testing.T) {
+	tests := []struct {
+		name        string
+		listenAddr  string
+		requestHost string
+		want        bool
+	}{
+		{name: "loopback literal", listenAddr: "127.0.0.1:8080", requestHost: "127.0.0.1:8080", want: true},
+		{name: "loopback localhost", listenAddr: "127.0.0.1:8080", requestHost: "localhost:8080", want: true},
+		{name: "loopback rebound domain", listenAddr: "127.0.0.1:8080", requestHost: "evil.test:8080", want: false},
+		{name: "wildcard literal", listenAddr: ":8080", requestHost: "192.0.2.10:8080", want: true},
+		{name: "wildcard localhost", listenAddr: "0.0.0.0:8080", requestHost: "localhost:8080", want: true},
+		{name: "wildcard rebound domain", listenAddr: "0.0.0.0:8080", requestHost: "evil.test:8080", want: false},
+		{name: "explicit hostname", listenAddr: "dialer.example:8080", requestHost: "dialer.example:443", want: true},
+		{name: "different hostname", listenAddr: "dialer.example:8080", requestHost: "evil.test:8080", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := browserDialerHostAllowed(test.requestHost, test.listenAddr); got != test.want {
+				t.Fatalf("browserDialerHostAllowed(%q, %q) = %v, want %v", test.requestHost, test.listenAddr, got, test.want)
+			}
+		})
+	}
+}
+
+func TestBrowserDialerPageDoesNotExposeTokenThroughCORS(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8080/", nil)
+	request.Header.Set("Origin", "https://attacker.example")
+	serveBrowserDialerPage(recorder, request, []byte("secret-token"), true)
+
+	response := recorder.Result()
+	defer response.Body.Close()
+	if allowOrigin := response.Header.Get("Access-Control-Allow-Origin"); allowOrigin != "" {
+		t.Fatalf("browser page exposes CORS origin %q", allowOrigin)
+	}
+	if got := response.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	if got := response.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+}
+
+func TestBrowserDialerPageRejectsStateChangingMethods(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/", nil)
+	serveBrowserDialerPage(recorder, request, []byte("secret-token"), true)
+	if recorder.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST status = %d, want %d", recorder.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+func TestBrowserDialerPageCompatibilityPolicy(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "http://proxy.example/browser", nil)
+	request.Header.Set("Origin", "https://embedding.example")
+	serveBrowserDialerPage(recorder, request, []byte("legacy-page"), false)
+
+	response := recorder.Result()
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("compatibility page status = %d, want 200", response.StatusCode)
+	}
+	if allowOrigin := response.Header.Get("Access-Control-Allow-Origin"); allowOrigin != "*" {
+		t.Fatalf("compatibility page Access-Control-Allow-Origin = %q, want *", allowOrigin)
+	}
+	if body := recorder.Body.String(); body != "legacy-page" {
+		t.Fatalf("compatibility page body = %q", body)
+	}
+}
+
+func TestReloadTracksBrowserDialerStrictPolicy(t *testing.T) {
+	addressName := platform.BrowserDialerAddress
+	strictName := platform.BrowserDialerStrict
+	previousAddress, hadAddress := os.LookupEnv(addressName)
+	previousStrict, hadStrict := os.LookupEnv(strictName)
+	if err := os.Setenv(addressName, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Unsetenv(strictName); err != nil {
+		t.Fatal(err)
+	}
+	Reload()
+	if currentStrict {
+		t.Fatal("Browser Dialer strict policy is not disabled by default")
+	}
+	if err := os.Setenv(strictName, "true"); err != nil {
+		t.Fatal(err)
+	}
+	Reload()
+	if !currentStrict {
+		t.Fatal("Reload did not apply Browser Dialer strict policy")
+	}
+	if err := os.Setenv(strictName, "false"); err != nil {
+		t.Fatal(err)
+	}
+	Reload()
+	if currentStrict {
+		t.Fatal("Reload did not explicitly disable Browser Dialer strict policy")
+	}
+	t.Cleanup(func() {
+		if hadAddress {
+			_ = os.Setenv(addressName, previousAddress)
+		} else {
+			_ = os.Unsetenv(addressName)
+		}
+		if hadStrict {
+			_ = os.Setenv(strictName, previousStrict)
+		} else {
+			_ = os.Unsetenv(strictName)
+		}
+		Reload()
+	})
 }
 
 func TestReloadBindFailureDoesNotAdvertiseBrowserDialer(t *testing.T) {
@@ -283,13 +446,26 @@ func TestDialPacketContextCancelsFinalBrowserAcknowledgement(t *testing.T) {
 	}
 }
 
-func TestEmbeddedHTTPTaskLifecycleAndCookieCoordination(t *testing.T) {
+func TestEmbeddedHTTPTasksPreserveCompatibilityAndOfferStrictMode(t *testing.T) {
 	page := string(webpage)
+	if strings.Count(page, `requestInit.redirect = "error";`) != 2 {
+		t.Fatal("strict Browser Dialer policy does not disable redirects for both fetch paths")
+	}
+	if !strings.Contains(page, "task.strict && response.status !== 200") ||
+		!strings.Contains(page, "task.strict && response.status === 200") ||
+		!strings.Contains(page, "!task.strict && response.ok") {
+		t.Fatal("embedded browser dialer does not preserve compatible 2xx handling behind an opt-in strict policy")
+	}
 	if strings.Count(page, "new AbortController()") < 2 {
 		t.Fatal("embedded browser dialer does not make both fetch paths abortable")
 	}
 	if strings.Count(page, "await fetchWithTaskCookies(task, requestInit, controller.signal);") != 2 {
 		t.Fatal("embedded browser dialer does not route both fetch paths through cookie isolation")
+	}
+	if !strings.Contains(page, "if (!task.strict || !task.extra || !task.extra.cookies)") ||
+		!strings.Contains(page, "target.protocol !== window.location.protocol") ||
+		!strings.Contains(page, "target.hostname !== window.location.hostname") {
+		t.Fatal("embedded browser dialer does not confine cookie scope checks to strict mode")
 	}
 	if strings.Contains(page, "cookieFetchTail") ||
 		!strings.Contains(page, `withCookieGate("read"`) ||
@@ -302,11 +478,15 @@ func TestEmbeddedHTTPTaskLifecycleAndCookieCoordination(t *testing.T) {
 		!strings.Contains(page, "window.isSecureContext") {
 		t.Fatal("embedded browser dialer does not coordinate its cookie gate across same-origin tabs when supported")
 	}
-	if !strings.Contains(page, `requestInit.credentials = "include"`) {
-		t.Fatal("embedded browser dialer does not retain compatible explicit-cookie credentials")
+	if !strings.Contains(page, `requestInit.credentials = "include"`) ||
+		!strings.Contains(page, `requestInit.credentials = "omit"`) {
+		t.Fatal("embedded browser dialer does not preserve compatible credentials with an opt-in strict override")
 	}
 	if !strings.Contains(page, "openWebSocketWithCookieIsolation(task, ws)") {
 		t.Fatal("embedded browser dialer WebSocket handshakes bypass cookie isolation")
+	}
+	if !strings.Contains(page, "if (task.strict)") || !strings.Contains(page, "handshakeTimer = setTimeout(() => fail(), 30000)") {
+		t.Fatal("embedded browser dialer does not confine its new WebSocket handshake timeout to strict mode")
 	}
 	if strings.Count(page, "bridge.readyState !== WebSocket.OPEN") < 2 {
 		t.Fatal("embedded browser dialer can orphan an upstream socket after its bridge closes")
@@ -326,7 +506,7 @@ func TestEmbeddedHTTPTaskLifecycleAndCookieCoordination(t *testing.T) {
 		!strings.Contains(page, "stableControlConnectionMs") {
 		t.Fatal("embedded browser dialer does not bound failed control-socket reconnection")
 	}
-	if !strings.Contains(page, `ws.send("ok")`) {
+	if !strings.Contains(page, "if (!task.strict)") || !strings.Contains(page, `ws.send("ok")`) {
 		t.Fatal("embedded browser dialer does not preserve the original stream setup acknowledgement")
 	}
 }

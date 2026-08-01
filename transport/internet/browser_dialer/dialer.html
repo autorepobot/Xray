@@ -47,11 +47,13 @@
 			controlReconnectAfter = Date.now() + delay;
 		}
 
-		function prepareRequestInit(extra) {
+		function prepareRequestInit(extra, strict) {
 			extra = extra || {};
 			const requestInit = {};
 			if (extra.cookies) {
 				requestInit.credentials = "include";
+			} else if (strict) {
+				requestInit.credentials = "omit";
 			}
 			if (extra.referrer) {
 				// note: we have to strip the protocol and host part.
@@ -90,6 +92,26 @@
 			for (const [name, value] of Object.entries(task.extra.cookies)) {
 				document.cookie = encodeURIComponent(name) + '=; path=' + url.pathname + '; Max-Age=0';
 			}
+		}
+
+		function cookieScopeError(task) {
+			if (!task.strict || !task.extra || !task.extra.cookies) {
+				return null;
+			}
+
+			let target;
+			try {
+				target = new URL(task.url);
+			} catch (error) {
+				return "browser dialer received an invalid cookie target URL";
+			}
+			// Host-only cookies ignore ports. We also require the same scheme here
+			// for SameSite and mixed-content safety. Fetch cannot set the forbidden
+			// Cookie header for a different host.
+			if (target.protocol !== window.location.protocol || target.hostname !== window.location.hostname) {
+				return "browser dialer cannot apply cookie metadata across scheme or hostname";
+			}
+			return null;
 		}
 
 		function cookieGateAbortReason(signal) {
@@ -193,8 +215,12 @@
 
 		async function fetchWithTaskCookies(task, requestInit, signal) {
 			if (!task.extra || !task.extra.cookies) {
-				// Ordinary requests retain the browser's original same-origin
-				// credential behavior, so coordinate them as readers.
+				// Strict requests omit credentials and cannot observe temporary task
+				// cookies. Compatibility requests retain the browser's original
+				// same-origin credential behavior, so coordinate them as readers.
+				if (task.strict) {
+					return await fetch(task.url, requestInit);
+				}
 				return await withCookieGate("read", signal, () => fetch(task.url, requestInit));
 			}
 
@@ -217,11 +243,13 @@
 			const controller = new AbortController();
 			let upstream = null;
 			let settled = false;
+			let handshakeTimer;
 			let rejectHandshake = null;
 			const fail = (error) => {
 				controller.abort();
 				if (!settled) {
 					settled = true;
+					clearTimeout(handshakeTimer);
 					if (rejectHandshake) {
 						rejectHandshake(error || new Error("upstream WebSocket handshake failed"));
 					}
@@ -254,9 +282,13 @@
 					}
 					if (!settled) {
 						settled = true;
+						clearTimeout(handshakeTimer);
 						resolve(upstream);
 					}
 				};
+				if (task.strict) {
+					handshakeTimer = setTimeout(() => fail(), 30000);
+				}
 			}));
 		}
 
@@ -302,6 +334,13 @@
 				resetControlReconnect();
 				clientIdleCount -= 1;
 				let task = JSON.parse(event.data);
+				const cookieError = cookieScopeError(task);
+				if (cookieError) {
+					console.error(cookieError);
+					ws.send(cookieError);
+					check();
+					return;
+				}
 				if (task.method == "WS") {
 					(async () => {
 						upstreamWsCount += 1;
@@ -336,11 +375,13 @@
 				}
 				else if (task.method == "GET" && task.streamResponse) {
 					(async () => {
-						const requestInit = prepareRequestInit(task.extra);
+						const requestInit = prepareRequestInit(task.extra, task.strict);
 
 						console.log("Dial GET", task.url);
-						// Preserve the original Browser Dialer setup acknowledgement.
-						ws.send("ok");
+						if (!task.strict) {
+							// Preserve the original Browser Dialer setup acknowledgement.
+							ws.send("ok");
+						}
 						const controller = new AbortController();
 
 						/*
@@ -370,7 +411,18 @@
 							upstreamGetCount += 1;
 
 							requestInit.signal = controller.signal;
+							if (task.strict) {
+								requestInit.redirect = "error";
+							}
 							const response = await fetchWithTaskCookies(task, requestInit, controller.signal);
+							if (task.strict && response.status !== 200) {
+								console.error("bad status code", response.status);
+								ws.send("fail");
+								return;
+							}
+							if (task.strict) {
+								ws.send("ok");
+							}
 
 							const body = await response.body;
 							reader = body.getReader();
@@ -390,12 +442,15 @@
 				else if (!task.streamResponse) {
 					upstreamPostCount += 1;
 
-					const requestInit = prepareRequestInit(task.extra);
+					const requestInit = prepareRequestInit(task.extra, task.strict);
 					requestInit.method = task.method;
 
 					console.log("Dial", task.method, task.url);
 					const controller = new AbortController();
 					requestInit.signal = controller.signal;
+					if (task.strict) {
+						requestInit.redirect = "error";
+					}
 					ws.onclose = () => controller.abort();
 					ws.send("ok");
 					ws.onmessage = async (event) => {
@@ -404,7 +459,7 @@
 								requestInit.body = event.data;
 							}
 							const response = await fetchWithTaskCookies(task, requestInit, controller.signal);
-							if (response.ok) {
+							if ((task.strict && response.status === 200) || (!task.strict && response.ok)) {
 								ws.send("ok");
 							} else {
 								console.error("bad status code");
