@@ -449,11 +449,15 @@ func (c *SplitHTTPConfig) Build() (proto.Message, error) {
 	if c.Xmux.MaxConnections.To > 0 && c.Xmux.MaxConcurrency.To > 0 {
 		return nil, errors.New("maxConnections cannot be specified together with maxConcurrency")
 	}
-	if c.Xmux == (XmuxConfig{}) {
-		c.Xmux.MaxConnections.From = 3
-		c.Xmux.MaxConnections.To = 3
+	if c.Xmux.MaxConcurrency == (Int32Range{}) && c.Xmux.MaxConnections == (Int32Range{}) {
+		c.Xmux.MaxConcurrency.From = 32
+		c.Xmux.MaxConcurrency.To = 64
+	}
+	if c.Xmux.HMaxRequestTimes == (Int32Range{}) {
 		c.Xmux.HMaxRequestTimes.From = 600
 		c.Xmux.HMaxRequestTimes.To = 900
+	}
+	if c.Xmux.HMaxReusableSecs == (Int32Range{}) {
 		c.Xmux.HMaxReusableSecs.From = 1800
 		c.Xmux.HMaxReusableSecs.To = 3000
 	}
